@@ -1,4 +1,4 @@
-//Оптимизированный скрипт который паралелить заполнение таблицы
+//Расчет дельты но только при нормально сортировки строк 1) Тикет 2) Дельта 3) Тикет 4) Дельта
 
 function fillMissingValuesBatchParallel() {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Объемы');
@@ -10,17 +10,21 @@ function fillMissingValuesBatchParallel() {
   const lastColumn = sheet.getLastColumn();
   const lastRow = sheet.getLastRow();
 
-  if (lastColumn < 2 || lastRow < 2) {
+  if (lastColumn < 3 || lastRow < 2) { // даты теперь с 3-го столбца
     Logger.log("Недостаточно данных");
     return;
   }
 
-  // Даты из первой строки, начиная со второго столбца
-  const datesTableFormat = sheet.getRange(1, 2, 1, lastColumn - 1).getValues()[0];
+  // Даты из первой строки, начиная с 3-го столбца
+  const datesTableFormat = sheet.getRange(1, 3, 1, lastColumn - 2).getValues()[0];
 
   // Тикеры из первого столбца, начиная со второй строки
   const tickersRange = sheet.getRange(2, 1, lastRow - 1, 1);
   const tickers = tickersRange.getValues().flat().filter(t => t && t.toString().trim() !== '');
+
+  // Признаки строк (Объем или Дельта) из столбца 2, начиная со второй строки
+  const rowTypesRange = sheet.getRange(2, 2, lastRow - 1, 1);
+  const rowTypes = rowTypesRange.getValues().flat();
 
   // Функция конвертации даты в формат YYYY-MM-DD
   function convertDateFormat(dateValue) {
@@ -65,6 +69,7 @@ function fillMissingValuesBatchParallel() {
     const response = responses[i];
     const tickerIndex = currentIndex + i;
     const ticker = tickers[tickerIndex];
+    const rowType = rowTypes[tickerIndex]; // тип строки: Объем или Дельта
 
     if (response.getResponseCode() !== 200) {
       Logger.log(`Ошибка HTTP ${response.getResponseCode()} для тикера ${ticker}`);
@@ -96,19 +101,62 @@ function fillMissingValuesBatchParallel() {
     const row = tickerIndex + 2; // строка в таблице для текущего тикера
 
     // Получаем текущие значения всей строки (по всем датам)
-    const currentRowValues = sheet.getRange(row, 2, 1, datesApiFormat.length).getValues()[0];
+    const currentRowValues = sheet.getRange(row, 3, 1, datesApiFormat.length).getValues()[0];
 
-    // Формируем массив значений для записи, не затирая уже заполненные ячейки
-    const rowValues = datesApiFormat.map((dateKey, idx) => {
-      if (currentRowValues[idx] !== '' && currentRowValues[idx] !== null) {
-        return currentRowValues[idx];
+    let rowValues;
+
+    if (rowType.toString().toLowerCase() === 'объем') {
+      // Для строк "Объем" — записываем значения VALUE из API, не затирая заполненные ячейки
+      rowValues = datesApiFormat.map((dateKey, idx) => {
+        if (currentRowValues[idx] !== '' && currentRowValues[idx] !== null) {
+          return currentRowValues[idx];
+        }
+        const val = valuesByDate[dateKey];
+        return (val !== undefined && val !== null) ? val : '';
+      });
+    } else if (rowType.toString().toLowerCase() === 'дельта') {
+      // Для строк "Дельта" — считаем % изменение по данным из строки "Объем" (предыдущая строка)
+      if (tickerIndex === 0) {
+        // Если это первая строка, нет предыдущей, записываем пустые значения
+        rowValues = new Array(datesApiFormat.length).fill('');
+      } else {
+        // Получаем значения объема из предыдущей строки
+        const volumeRowValues = sheet.getRange(row - 1, 3, 1, datesApiFormat.length).getValues()[0];
+        rowValues = [];
+
+        for (let idx = 0; idx < datesApiFormat.length; idx++) {
+          if (idx === 0) {
+            // Для первой даты дельта не считается
+            rowValues.push('');
+            continue;
+          }
+          const prevVal = parseFloat(volumeRowValues[idx - 1]);
+          const currVal = parseFloat(volumeRowValues[idx]);
+
+          if (isNaN(prevVal) || prevVal === 0 || isNaN(currVal)) {
+            rowValues.push('');
+          } else {
+            const delta = ((currVal - prevVal) / prevVal) * 100;
+            rowValues.push(delta / 100);  // делим на 100 для корректного отображения процентов
+          }
+        }
       }
-      const val = valuesByDate[dateKey];
-      return (val !== undefined && val !== null) ? val : '';
-    });
+    } else {
+      // Если признак строки не "Объем" и не "Дельта", просто пропускаем
+      continue;
+    }
 
     // Записываем всю строку за один вызов
-    sheet.getRange(row, 2, 1, datesApiFormat.length).setValues([rowValues]);
+    sheet.getRange(row, 3, 1, datesApiFormat.length).setValues([rowValues]);
+
+    // Устанавливаем формат ячеек в зависимости от типа строки
+    if (rowType.toString().toLowerCase() === 'дельта') {
+      // Формат процентов
+      sheet.getRange(row, 3, 1, datesApiFormat.length).setNumberFormat('0.00%');
+    } else if (rowType.toString().toLowerCase() === 'объем') {
+      // Формат Russian Ruble с локалью
+      sheet.getRange(row, 3, 1, datesApiFormat.length).setNumberFormat('#,##0.00[$ ₽] ');
+    }
   }
 
   // Обновляем индекс и создаём триггер для следующей пачки
