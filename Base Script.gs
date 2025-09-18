@@ -1,22 +1,22 @@
-//Скрипт который считает еще и по LQDT
+//Скрипт который считает среднюю + окрашивает выходные и праздничные дни + заполняет выходные и праздничны дни данными предыдущего дня
 
 function fillMissingValuesBatchParallel() {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Объемы');
   if (!sheet) {
     Logger.log("Лист 'Объемы' не найден");
     return;
-  }
+  }A
 
   const lastColumn = sheet.getLastColumn();
   const lastRow = sheet.getLastRow();
 
-  if (lastColumn < 3 || lastRow < 2) {
+  if (lastColumn < 4 || lastRow < 2) { // теперь минимум 4 столбца
     Logger.log("Недостаточно данных");
     return;
   }
 
-  // Даты из первой строки, начиная с 3-го столбца
-  const datesTableFormat = sheet.getRange(1, 3, 1, lastColumn - 2).getValues()[0];
+  // Даты из первой строки, начиная с 4-го столбца (т.к. столбец 3 - Средняя)
+  const datesTableFormat = sheet.getRange(1, 4, 1, lastColumn - 3).getValues()[0];
 
   // Тикеры из первого столбца, начиная со второй строки
   const tickersRange = sheet.getRange(2, 1, lastRow - 1, 1);
@@ -62,18 +62,25 @@ function fillMissingValuesBatchParallel() {
     }
   }
 
+  // Получаем список выходных и праздничных дней из API isdayoff.ru для текущего года
+  const currentYear = new Date().getFullYear();
+  const russianHolidaysAndWeekends = getRussianWorkCalendar(currentYear);
+
+  // Функция проверки, является ли дата выходным или праздником
+  const isHolidayOrWeekend = (dateStr) => russianHolidaysAndWeekends.includes(dateStr);
+
   // Формируем массив запросов для fetchAll
   const requests = [];
-for (let i = currentIndex; i < endIndex; i++) {
-  const ticker = tickers[i];
-  let url;
-  if (ticker.toUpperCase() === 'LQDT') {
-    url = `https://iss.moex.com/iss/history/engines/stock/markets/shares/securities/${ticker}.json?from=${fromDate}&till=${tillDate}`;
-  } else {
-    url = `https://iss.moex.com/iss/history/engines/stock/markets/shares/boards/TQBR/securities/${ticker}.json?from=${fromDate}&till=${tillDate}`;
+  for (let i = currentIndex; i < endIndex; i++) {
+    const ticker = tickers[i];
+    let url;
+    if (ticker.toUpperCase() === 'LQDT') {
+      url = `https://iss.moex.com/iss/history/engines/stock/markets/shares/securities/${ticker}.json?from=${fromDate}&till=${tillDate}`;
+    } else {
+      url = `https://iss.moex.com/iss/history/engines/stock/markets/shares/boards/TQBR/securities/${ticker}.json?from=${fromDate}&till=${tillDate}`;
+    }
+    requests.push({ url: url, muteHttpExceptions: true });
   }
-  requests.push({ url: url, muteHttpExceptions: true });
-}
 
   // Выполняем параллельные запросы
   const responses = UrlFetchApp.fetchAll(requests);
@@ -114,18 +121,27 @@ for (let i = currentIndex; i < endIndex; i++) {
     const row = tickerIndex + 2; // строка в таблице для текущего тикера
 
     // Получаем текущие значения всей строки (по всем датам)
-    const currentRowValues = sheet.getRange(row, 3, 1, datesApiFormat.length).getValues()[0];
+    // Данные начинаются с 4-го столбца (т.к. 3-й - Средняя)
+    const currentRowValues = sheet.getRange(row, 4, 1, datesApiFormat.length).getValues()[0];
 
     let rowValues;
 
     if (rowType === 'объем') {
       // Для строк "Объем" — записываем значения VALUE из API, не затирая заполненные ячейки
+      // и заполняем пропуски значением последнего рабочего дня
+      let lastKnownValue = null;
       rowValues = datesApiFormat.map((dateKey, idx) => {
         if (currentRowValues[idx] !== '' && currentRowValues[idx] !== null) {
+          lastKnownValue = currentRowValues[idx];
           return currentRowValues[idx];
         }
         const val = valuesByDate[dateKey];
-        return (val !== undefined && val !== null) ? val : '';
+        if (val !== undefined && val !== null) {
+          lastKnownValue = val;
+          return val;
+        }
+        // Если данных нет, возвращаем последнее известное значение (для выходных)
+        return lastKnownValue !== null ? lastKnownValue : '';
       });
     } else if (rowType === 'дельта') {
       // Для строк "Дельта" — считаем % изменение по данным из строки "Объем" с тем же тикером
@@ -134,7 +150,7 @@ for (let i = currentIndex; i < endIndex; i++) {
         Logger.log(`Не найдена строка Объем для тикера ${ticker}, пропускаем дельту`);
         continue;
       }
-      const volumeValues = sheet.getRange(volumeRow, 3, 1, datesApiFormat.length).getValues()[0];
+      const volumeValues = sheet.getRange(volumeRow, 4, 1, datesApiFormat.length).getValues()[0];
       rowValues = [];
 
       for (let idx = 0; idx < datesApiFormat.length; idx++) {
@@ -158,15 +174,39 @@ for (let i = currentIndex; i < endIndex; i++) {
     }
 
     // Записываем всю строку за один вызов
-    sheet.getRange(row, 3, 1, datesApiFormat.length).setValues([rowValues]);
+    sheet.getRange(row, 4, 1, datesApiFormat.length).setValues([rowValues]);
+
+    // Рассчитываем среднее значение по строке (объем или дельта), игнорируя пустые и null
+    const numericValues = rowValues.filter(v => typeof v === 'number' && !isNaN(v));
+    const avg = numericValues.length > 0 ? numericValues.reduce((a, b) => a + b, 0) / numericValues.length : '';
+
+    // Записываем среднее значение в столбец 3 ("Средняя")
+    sheet.getRange(row, 3).setValue(avg);
 
     // Устанавливаем формат ячеек в зависимости от типа строки
     if (rowType === 'дельта') {
-      sheet.getRange(row, 3, 1, datesApiFormat.length).setNumberFormat('0.00%');
+      sheet.getRange(row, 4, 1, datesApiFormat.length).setNumberFormat('0.00%');
+      sheet.getRange(row, 3).setNumberFormat('0.00%'); // форматируем среднее как процент
     } else if (rowType === 'объем') {
-      sheet.getRange(row, 3, 1, datesApiFormat.length).setNumberFormat('#,##0.00[$ ₽]');
+      sheet.getRange(row, 4, 1, datesApiFormat.length).setNumberFormat('#,##0.00[$ ₽]');
+      sheet.getRange(row, 3).setNumberFormat('#,##0.00[$ ₽]'); // форматируем среднее как объем
     }
   }
+
+  // Окрашиваем столбцы с выходными и праздничными днями согласно производственному календарю
+  const weekendColor = '#fff2cc';
+  const dataStartRow = 2;
+  const dataEndRow = lastRow;
+
+  datesApiFormat.forEach((dateStr, idx) => {
+    if (!dateStr) return;
+    if (isHolidayOrWeekend(dateStr)) {
+      sheet.getRange(dataStartRow, idx + 4, dataEndRow - 1, 1).setBackground(weekendColor);
+    } else {
+      // Очистить фон, если нужно
+      // sheet.getRange(dataStartRow, idx + 4, dataEndRow - 1, 1).setBackground(null);
+    }
+  });
 
   // Обновляем индекс и создаём триггер для следующей пачки
   if (endIndex >= tickers.length) {
@@ -191,3 +231,25 @@ function deleteTimeDrivenTriggers() {
     }
   });
 }
+
+// Функция для получения официальных выходных и праздничных дней России по производственному календарю с isdayoff.ru
+function getRussianWorkCalendar(year) {
+  const weekendsAndHolidays = [];
+  for (let month = 1; month <= 12; month++) {
+    const url = `https://isdayoff.ru/api/getdata?year=${year}&month=${month}&cc=ru`;
+    try {
+      const response = UrlFetchApp.fetch(url);
+      if (response.getResponseCode() !== 200) {
+        Logger.log(`Ошибка при получении данных за ${year}-${month}`);
+        continue;
+      }
+      const data = response.getContentText(); // строка из 0 и 1 по дням месяца
+      for (let day = 1; day <= data.length; day++) {
+        if (data.charAt(day - 1) === '1') {
+          const mm = month < 10 ? '0' + month : month;
+          const dd = day < 10 ? '0' + day : day;
+          weekendsAndHolidays.push(`${year}-${mm}-${dd}`);
+        }
+      }
+    } catch (e) {
+      Logger.log(`Ошибка запроса isdayoff.ru за ${year}-${month}: ${e}`);
