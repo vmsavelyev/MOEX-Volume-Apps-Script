@@ -1,4 +1,4 @@
-//Расчет дельты но только при нормально сортировки строк 1) Тикет 2) Дельта 3) Тикет 4) Дельта
+//Скрипт который считает еще и по LQDT
 
 function fillMissingValuesBatchParallel() {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Объемы');
@@ -10,7 +10,7 @@ function fillMissingValuesBatchParallel() {
   const lastColumn = sheet.getLastColumn();
   const lastRow = sheet.getLastRow();
 
-  if (lastColumn < 3 || lastRow < 2) { // даты теперь с 3-го столбца
+  if (lastColumn < 3 || lastRow < 2) {
     Logger.log("Недостаточно данных");
     return;
   }
@@ -20,7 +20,7 @@ function fillMissingValuesBatchParallel() {
 
   // Тикеры из первого столбца, начиная со второй строки
   const tickersRange = sheet.getRange(2, 1, lastRow - 1, 1);
-  const tickers = tickersRange.getValues().flat().filter(t => t && t.toString().trim() !== '');
+  const tickers = tickersRange.getValues().flat();
 
   // Признаки строк (Объем или Дельта) из столбца 2, начиная со второй строки
   const rowTypesRange = sheet.getRange(2, 2, lastRow - 1, 1);
@@ -54,13 +54,26 @@ function fillMissingValuesBatchParallel() {
   const batchSize = 100;
   const endIndex = Math.min(currentIndex + batchSize, tickers.length);
 
+  // Создаём словарь тикер -> индекс строки с объемом
+  const volumeTickerToRow = {};
+  for (let i = 0; i < tickers.length; i++) {
+    if (rowTypes[i].toString().toLowerCase() === 'объем') {
+      volumeTickerToRow[tickers[i]] = i + 2; // строка в таблице, начиная с 2-й
+    }
+  }
+
   // Формируем массив запросов для fetchAll
   const requests = [];
-  for (let i = currentIndex; i < endIndex; i++) {
-    const ticker = tickers[i];
-    const url = `https://iss.moex.com/iss/history/engines/stock/markets/shares/boards/TQBR/securities/${ticker}.json?from=${fromDate}&till=${tillDate}`;
-    requests.push({ url: url, muteHttpExceptions: true });
+for (let i = currentIndex; i < endIndex; i++) {
+  const ticker = tickers[i];
+  let url;
+  if (ticker.toUpperCase() === 'LQDT') {
+    url = `https://iss.moex.com/iss/history/engines/stock/markets/shares/securities/${ticker}.json?from=${fromDate}&till=${tillDate}`;
+  } else {
+    url = `https://iss.moex.com/iss/history/engines/stock/markets/shares/boards/TQBR/securities/${ticker}.json?from=${fromDate}&till=${tillDate}`;
   }
+  requests.push({ url: url, muteHttpExceptions: true });
+}
 
   // Выполняем параллельные запросы
   const responses = UrlFetchApp.fetchAll(requests);
@@ -69,7 +82,7 @@ function fillMissingValuesBatchParallel() {
     const response = responses[i];
     const tickerIndex = currentIndex + i;
     const ticker = tickers[tickerIndex];
-    const rowType = rowTypes[tickerIndex]; // тип строки: Объем или Дельта
+    const rowType = rowTypes[tickerIndex].toString().toLowerCase();
 
     if (response.getResponseCode() !== 200) {
       Logger.log(`Ошибка HTTP ${response.getResponseCode()} для тикера ${ticker}`);
@@ -105,7 +118,7 @@ function fillMissingValuesBatchParallel() {
 
     let rowValues;
 
-    if (rowType.toString().toLowerCase() === 'объем') {
+    if (rowType === 'объем') {
       // Для строк "Объем" — записываем значения VALUE из API, не затирая заполненные ячейки
       rowValues = datesApiFormat.map((dateKey, idx) => {
         if (currentRowValues[idx] !== '' && currentRowValues[idx] !== null) {
@@ -114,31 +127,29 @@ function fillMissingValuesBatchParallel() {
         const val = valuesByDate[dateKey];
         return (val !== undefined && val !== null) ? val : '';
       });
-    } else if (rowType.toString().toLowerCase() === 'дельта') {
-      // Для строк "Дельта" — считаем % изменение по данным из строки "Объем" (предыдущая строка)
-      if (tickerIndex === 0) {
-        // Если это первая строка, нет предыдущей, записываем пустые значения
-        rowValues = new Array(datesApiFormat.length).fill('');
-      } else {
-        // Получаем значения объема из предыдущей строки
-        const volumeRowValues = sheet.getRange(row - 1, 3, 1, datesApiFormat.length).getValues()[0];
-        rowValues = [];
+    } else if (rowType === 'дельта') {
+      // Для строк "Дельта" — считаем % изменение по данным из строки "Объем" с тем же тикером
+      const volumeRow = volumeTickerToRow[ticker];
+      if (!volumeRow) {
+        Logger.log(`Не найдена строка Объем для тикера ${ticker}, пропускаем дельту`);
+        continue;
+      }
+      const volumeValues = sheet.getRange(volumeRow, 3, 1, datesApiFormat.length).getValues()[0];
+      rowValues = [];
 
-        for (let idx = 0; idx < datesApiFormat.length; idx++) {
-          if (idx === 0) {
-            // Для первой даты дельта не считается
-            rowValues.push('');
-            continue;
-          }
-          const prevVal = parseFloat(volumeRowValues[idx - 1]);
-          const currVal = parseFloat(volumeRowValues[idx]);
+      for (let idx = 0; idx < datesApiFormat.length; idx++) {
+        if (idx === 0) {
+          rowValues.push('');
+          continue;
+        }
+        const prevVal = parseFloat(volumeValues[idx - 1]);
+        const currVal = parseFloat(volumeValues[idx]);
 
-          if (isNaN(prevVal) || prevVal === 0 || isNaN(currVal)) {
-            rowValues.push('');
-          } else {
-            const delta = ((currVal - prevVal) / prevVal) * 100;
-            rowValues.push(delta / 100);  // делим на 100 для корректного отображения процентов
-          }
+        if (isNaN(prevVal) || prevVal === 0 || isNaN(currVal)) {
+          rowValues.push('');
+        } else {
+          const delta = ((currVal - prevVal) / prevVal) * 100;
+          rowValues.push(delta / 100); // делим на 100 для корректного отображения процентов
         }
       }
     } else {
@@ -150,12 +161,10 @@ function fillMissingValuesBatchParallel() {
     sheet.getRange(row, 3, 1, datesApiFormat.length).setValues([rowValues]);
 
     // Устанавливаем формат ячеек в зависимости от типа строки
-    if (rowType.toString().toLowerCase() === 'дельта') {
-      // Формат процентов
+    if (rowType === 'дельта') {
       sheet.getRange(row, 3, 1, datesApiFormat.length).setNumberFormat('0.00%');
-    } else if (rowType.toString().toLowerCase() === 'объем') {
-      // Формат Russian Ruble с локалью
-      sheet.getRange(row, 3, 1, datesApiFormat.length).setNumberFormat('#,##0.00[$ ₽] ');
+    } else if (rowType === 'объем') {
+      sheet.getRange(row, 3, 1, datesApiFormat.length).setNumberFormat('#,##0.00[$ ₽]');
     }
   }
 
