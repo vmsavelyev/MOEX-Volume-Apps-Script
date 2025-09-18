@@ -1,11 +1,14 @@
-//Скрипт который считает среднюю + окрашивает выходные и праздничные дни + заполняет выходные и праздничны дни данными предыдущего дня
+1) Добавил изменение цены в % в рамках дня. См строку Изменение. Данные берутся напрямую с API MOEX-а, никаких дополнительных вычислений не производится. Визуально - вроде бы бьется цена. 
+
+2) В скрипте есть правило которое не позволяло заполнять данные по текущему дню, если он еще не закончен. Так вот, окончанием дня считалось 20:00 по МсК. Теперь будет 23:55.
+
 
 function fillMissingValuesBatchParallel() {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Объемы');
   if (!sheet) {
     Logger.log("Лист 'Объемы' не найден");
     return;
-  }A
+  }
 
   const lastColumn = sheet.getLastColumn();
   const lastRow = sheet.getLastRow();
@@ -22,7 +25,7 @@ function fillMissingValuesBatchParallel() {
   const tickersRange = sheet.getRange(2, 1, lastRow - 1, 1);
   const tickers = tickersRange.getValues().flat();
 
-  // Признаки строк (Объем или Дельта) из столбца 2, начиная со второй строки
+  // Признаки строк (Объем, Дельта, Изменение) из столбца 2, начиная со второй строки
   const rowTypesRange = sheet.getRange(2, 2, lastRow - 1, 1);
   const rowTypes = rowTypesRange.getValues().flat();
 
@@ -47,6 +50,37 @@ function fillMissingValuesBatchParallel() {
   const datesApiFormat = datesTableFormat.map(d => convertDateFormat(d));
   const fromDate = datesApiFormat[0];
   const tillDate = datesApiFormat[datesApiFormat.length - 1];
+
+  // Функция проверки, завершился ли торговый день для данной даты
+  function isDateFinished(dateStr) {
+    // dateStr в формате 'YYYY-MM-DD'
+    const now = new Date();
+
+    // Московское время (UTC+3)
+    const nowMSK = new Date(now.toLocaleString("en-US", {timeZone: "Europe/Moscow"}));
+
+    const dateParts = dateStr.split('-');
+    if (dateParts.length !== 3) return false;
+
+    const year = Number(dateParts[0]);
+    const month = Number(dateParts[1]) - 1; // в JS месяцы 0-11
+    const day = Number(dateParts[2]);
+
+    const date = new Date(year, month, day);
+
+    // Если дата в будущем — возвращаем false
+    if (date > nowMSK) return false;
+
+    // Если дата — сегодня, проверяем время (например, считаем день завершённым после 20:00 МСК)
+    if (date.toDateString() === nowMSK.toDateString()) {
+    if (nowMSK.getHours() < 23 || (nowMSK.getHours() === 23 && nowMSK.getMinutes() < 55)) {
+    return false; // ещё не завершился торговый день
+      }
+    }
+
+    // Иначе — день завершён
+    return true;
+  }
 
   const scriptProperties = PropertiesService.getScriptProperties();
   let currentIndex = Number(scriptProperties.getProperty('currentIndex')) || 0;
@@ -105,19 +139,6 @@ function fillMissingValuesBatchParallel() {
       continue;
     }
 
-    const valueIndex = columns.indexOf('VALUE');
-    const dateIndex = columns.indexOf('TRADEDATE');
-    if (valueIndex === -1 || dateIndex === -1) {
-      Logger.log(`Не найден столбец VALUE или TRADEDATE для тикера ${ticker}`);
-      continue;
-    }
-
-    // Создаём словарь дата -> value
-    const valuesByDate = {};
-    data.forEach(row => {
-      valuesByDate[row[dateIndex]] = row[valueIndex];
-    });
-
     const row = tickerIndex + 2; // строка в таблице для текущего тикера
 
     // Получаем текущие значения всей строки (по всем датам)
@@ -127,10 +148,26 @@ function fillMissingValuesBatchParallel() {
     let rowValues;
 
     if (rowType === 'объем') {
+      const valueIndex = columns.indexOf('VALUE');
+      const dateIndex = columns.indexOf('TRADEDATE');
+      if (valueIndex === -1 || dateIndex === -1) {
+        Logger.log(`Не найден столбец VALUE или TRADEDATE для тикера ${ticker}`);
+        continue;
+      }
+      // Создаём словарь дата -> value
+      const valuesByDate = {};
+      data.forEach(row => {
+        valuesByDate[row[dateIndex]] = row[valueIndex];
+      });
+
       // Для строк "Объем" — записываем значения VALUE из API, не затирая заполненные ячейки
       // и заполняем пропуски значением последнего рабочего дня
       let lastKnownValue = null;
       rowValues = datesApiFormat.map((dateKey, idx) => {
+        if (!isDateFinished(dateKey)) {
+          // День не завершён — оставляем ячейку как есть или пустой
+          return currentRowValues[idx] !== '' && currentRowValues[idx] !== null ? currentRowValues[idx] : '';
+        }
         if (currentRowValues[idx] !== '' && currentRowValues[idx] !== null) {
           lastKnownValue = currentRowValues[idx];
           return currentRowValues[idx];
@@ -144,7 +181,6 @@ function fillMissingValuesBatchParallel() {
         return lastKnownValue !== null ? lastKnownValue : '';
       });
     } else if (rowType === 'дельта') {
-      // Для строк "Дельта" — считаем % изменение по данным из строки "Объем" с тем же тикером
       const volumeRow = volumeTickerToRow[ticker];
       if (!volumeRow) {
         Logger.log(`Не найдена строка Объем для тикера ${ticker}, пропускаем дельту`);
@@ -154,6 +190,11 @@ function fillMissingValuesBatchParallel() {
       rowValues = [];
 
       for (let idx = 0; idx < datesApiFormat.length; idx++) {
+        if (!isDateFinished(datesApiFormat[idx])) {
+          // День не завершён — оставляем пустым или текущим значением
+          rowValues.push(currentRowValues[idx] !== '' && currentRowValues[idx] !== null ? currentRowValues[idx] : '');
+          continue;
+        }
         if (idx === 0) {
           rowValues.push('');
           continue;
@@ -164,19 +205,45 @@ function fillMissingValuesBatchParallel() {
         if (isNaN(prevVal) || prevVal === 0 || isNaN(currVal)) {
           rowValues.push('');
         } else {
-          const delta = ((currVal - prevVal) / prevVal) * 100;
-          rowValues.push(delta / 100); // делим на 100 для корректного отображения процентов
+          const delta = ((currVal - prevVal) / prevVal);
+          rowValues.push(delta);
         }
       }
+    } else if (rowType === 'изменение') {
+      const trendIndex = columns.indexOf('TRENDCLSPR');
+      const dateIndex = columns.indexOf('TRADEDATE');
+
+      if (trendIndex === -1 || dateIndex === -1) {
+        Logger.log(`Не найден столбец TRENDCLSPR или TRADEDATE для тикера ${ticker}`);
+        continue;
+      }
+
+      // Создаём словарь дата -> trend
+      const trendByDate = {};
+      data.forEach(row => {
+        trendByDate[row[dateIndex]] = row[trendIndex];
+      });
+
+      rowValues = datesApiFormat.map((dateKey, idx) => {
+        if (!isDateFinished(dateKey)) {
+          // День не завершён — оставляем ячейку как есть или пустой
+          return currentRowValues[idx] !== '' && currentRowValues[idx] !== null ? currentRowValues[idx] : '';
+        }
+        const trendVal = trendByDate[dateKey];
+        if (trendVal === undefined || trendVal === null || isNaN(trendVal)) {
+          return '';
+        }
+        return trendVal / 100; // предположим, что TRENDCLSPR в процентах, делим на 100 для формата
+      });
     } else {
-      // Если признак строки не "Объем" и не "Дельта", просто пропускаем
+      // Если признак строки не подходит, пропускаем
       continue;
     }
 
     // Записываем всю строку за один вызов
     sheet.getRange(row, 4, 1, datesApiFormat.length).setValues([rowValues]);
 
-    // Рассчитываем среднее значение по строке (объем или дельта), игнорируя пустые и null
+    // Рассчитываем среднее значение по строке, игнорируя пустые и null
     const numericValues = rowValues.filter(v => typeof v === 'number' && !isNaN(v));
     const avg = numericValues.length > 0 ? numericValues.reduce((a, b) => a + b, 0) / numericValues.length : '';
 
@@ -184,7 +251,7 @@ function fillMissingValuesBatchParallel() {
     sheet.getRange(row, 3).setValue(avg);
 
     // Устанавливаем формат ячеек в зависимости от типа строки
-    if (rowType === 'дельта') {
+    if (rowType === 'дельта' || rowType === 'изменение') {
       sheet.getRange(row, 4, 1, datesApiFormat.length).setNumberFormat('0.00%');
       sheet.getRange(row, 3).setNumberFormat('0.00%'); // форматируем среднее как процент
     } else if (rowType === 'объем') {
@@ -208,11 +275,41 @@ function fillMissingValuesBatchParallel() {
     }
   });
 
-  // Обновляем индекс и создаём триггер для следующей пачки
+  // Обновляем индекс и создаём триггер для следующей пачки или на следующий день в 4:00 МСК
   if (endIndex >= tickers.length) {
     Logger.log('Все тикеры обработаны.');
     scriptProperties.deleteProperty('currentIndex');
+
+    // Удаляем старые триггеры
+    deleteTimeDrivenTriggers();
+
+    // Создаём триггер на следующий день в 4:00 утра по московскому времени
+    const now = new Date();
+
+    // Получаем текущую дату и время в МСК
+    const nowMSK = new Date(now.toLocaleString("en-US", {timeZone: "Europe/Moscow"}));
+
+    // Создаём дату следующего дня в 4:00 МСК
+    const nextDayMSK = new Date(
+      nowMSK.getFullYear(),
+      nowMSK.getMonth(),
+      nowMSK.getDate() + 1,
+      4, 0, 0, 0
+    );
+
+    // Переводим nextDayMSK в локальное время сервера (по часовому поясу скрипта)
+    // Для этого берём разницу между nowMSK и now и корректируем дату
+    const offset = now.getTime() - nowMSK.getTime();
+    const triggerTime = new Date(nextDayMSK.getTime() + offset);
+
+    ScriptApp.newTrigger('fillMissingValuesBatchParallel')
+      .timeBased()
+      .at(triggerTime)
+      .create();
+
+    Logger.log(`Создан триггер на следующий день в 4:00 утра МСК: ${triggerTime}`);
   } else {
+    // Текущая логика с запуском через 5 секунд для следующей пачки
     scriptProperties.setProperty('currentIndex', endIndex.toString());
     deleteTimeDrivenTriggers();
     ScriptApp.newTrigger('fillMissingValuesBatchParallel')
@@ -253,3 +350,7 @@ function getRussianWorkCalendar(year) {
       }
     } catch (e) {
       Logger.log(`Ошибка запроса isdayoff.ru за ${year}-${month}: ${e}`);
+    }
+  }
+  return weekendsAndHolidays;
+}
